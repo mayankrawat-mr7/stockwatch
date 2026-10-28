@@ -1,339 +1,209 @@
-import { useEffect } from "react";
-import { useFetcher } from "react-router";
-import { useAppBridge } from "@shopify/app-bridge-react";
-import { boundary } from "@shopify/shopify-app-react-router/server";
+// Form sends the button click to the action. useActionData holds the result.
+import { Form, Link, useActionData, useLoaderData, useNavigation } from "react-router";
+import { isAllowed } from "../utils/rateLimit.js";
+// authenticate checks the request came from the store.
 import { authenticate } from "../shopify.server";
 
+// The database client, used to save history rows.
+import db from "../db.server";
+
+// The status rules, the threshold reader, and the history writer.
+import { getStatus } from "../logic/status.js";
+import { readThreshold } from "../config/readConfig.js";
+import { recordIfChanged } from "../logic/history.js";
+
+// Runs when the page opens. It loads one page of products to display.
 export const loader = async ({ request }) => {
-  await authenticate.admin(request);
-
-  return null;
-};
-
-export const action = async ({ request }) => {
   const { admin } = await authenticate.admin(request);
-  const color = ["Red", "Orange", "Yellow", "Green"][
-    Math.floor(Math.random() * 4)
-  ];
-  const response = await admin.graphql(
+
+  // The page number is passed as a "cursor" in the web address.
+  const url = new URL(request.url);
+  const cursor = url.searchParams.get("cursor");
+
+  const threshold = await readThreshold(admin);
+
+  const res = await admin.graphql(
     `#graphql
-      mutation populateProduct($product: ProductCreateInput!) {
-        productCreate(product: $product) {
-          product {
+    query Products($cursor: String) {
+      products(first: 20, after: $cursor) {
+        edges {
+          node {
             id
             title
-            handle
-            status
-            variants(first: 10) {
-              edges {
-                node {
-                  id
-                  price
-                  barcode
-                  createdAt
-                }
-              }
+            totalInventory
+            featuredMedia {
+              preview { image { url altText } }
             }
-            demoInfo: metafield(namespace: "$app", key: "demo_info") {
-              jsonValue
+            variants(first: 20) {
+              nodes {
+                inventoryItem { tracked }
+              }
             }
           }
         }
-      }`,
-    {
-      variables: {
-        product: {
-          title: `${color} Snowboard`,
-          metafields: [
-            {
-              namespace: "$app",
-              key: "demo_info",
-              value: "Created by React Router Template",
-            },
-          ],
-        },
-      },
-    },
-  );
-  const responseJson = await response.json();
-  const product = responseJson.data.productCreate.product;
-  const variantId = product.variants.edges[0].node.id;
-  const variantResponse = await admin.graphql(
-    `#graphql
-    mutation shopifyReactRouterTemplateUpdateVariant($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
-      productVariantsBulkUpdate(productId: $productId, variants: $variants) {
-        productVariants {
-          id
-          price
-          barcode
-          createdAt
-        }
+        pageInfo { hasNextPage endCursor }
       }
     }`,
-    {
-      variables: {
-        productId: product.id,
-        variants: [{ id: variantId, price: "100.00" }],
-      },
-    },
+    { variables: { cursor } }
   );
-  const variantResponseJson = await variantResponse.json();
-  const metaobjectResponse = await admin.graphql(
-    `#graphql
-    mutation shopifyReactRouterTemplateUpsertMetaobject($handle: MetaobjectHandleInput!, $values: JSON!) {
-      metaobjectUpsert(handle: $handle, values: $values) {
-        metaobject {
-          id
-          handle
-          values
-        }
-        userErrors {
-          field
-          message
-        }
-      }
-    }`,
-    {
-      variables: {
-        handle: {
-          type: "$app:example",
-          handle: "demo-entry",
-        },
-        values: {
-          title: "Demo Entry",
-          description:
-            "This metaobject was created by the Shopify app template to demonstrate the metaobject API.",
-        },
-      },
-    },
-  );
-  const metaobjectResponseJson = await metaobjectResponse.json();
 
-  return {
-    product: responseJson.data.productCreate.product,
-    variant: variantResponseJson.data.productVariantsBulkUpdate.productVariants,
-    metaobject: metaobjectResponseJson.data.metaobjectUpsert.metaobject,
-  };
+  const { data } = await res.json();
+
+  const products = data.products.edges.map(({ node }) => {
+    // A product counts as tracked if any of its variants tracks stock.
+    const tracked = node.variants.nodes.some((v) => v.inventoryItem.tracked);
+
+    return {
+      id: node.id,
+      title: node.title,
+      totalInventory: node.totalInventory,
+      featuredMedia: node.featuredMedia,
+      // Untracked products are never marked low or sold out.
+      status: tracked ? getStatus(node.totalInventory, threshold) : "not tracked",
+    };
+  });
+
+  return { products, threshold, pageInfo: data.products.pageInfo };
 };
 
-export default function Index() {
-  const fetcher = useFetcher();
-  const shopify = useAppBridge();
-  const isLoading =
-    ["loading", "submitting"].includes(fetcher.state) &&
-    fetcher.formMethod === "POST";
+// Runs when "Bring all in line" is clicked. It checks every product in the store.
+export const action = async ({ request }) => {
+  const { admin, session } = await authenticate.admin(request);
+  const shop = session.shop;
+  // Bring all in line walks the whole catalogue, so allow only 2 runs per 5 minutes.
+  if (!isAllowed(`reconcile:${shop}`, 2, 5 * 60_000)) {
+    return { error: "This was run recently. Wait a few minutes and try again." };
+  }
+  // Use the current threshold for every product.
+  const threshold = await readThreshold(admin);
 
-  useEffect(() => {
-    if (fetcher.data?.product?.id) {
-      shopify.toast.show("Product created");
+  let cursor = null;
+  let hasNext = true;
+  let checked = 0;
+  let written = 0;
+
+  // Walk through the whole catalogue, 50 products at a time.
+  // A bulk operation would be faster for very large stores.
+  while (hasNext) {
+    const res = await admin.graphql(
+      `#graphql
+      query Products($cursor: String) {
+        products(first: 50, after: $cursor) {
+          edges {
+            node {
+              id
+              totalInventory
+              variants(first: 20) {
+                nodes { inventoryItem { tracked } }
+              }
+            }
+          }
+          pageInfo { hasNextPage endCursor }
+        }
+      }`,
+      { variables: { cursor } }
+    );
+
+    const { data } = await res.json();
+
+    for (const { node } of data.products.edges) {
+      // Skip untracked products, the same as the dashboard does.
+      const tracked = node.variants.nodes.some((v) => v.inventoryItem.tracked);
+      if (!tracked) continue;
+
+      checked++;
+
+      // Save a row only if the status differs from the last saved row.
+      const row = await recordIfChanged(db, {
+        shop,
+        productId: node.id,
+        quantity: node.totalInventory,
+        threshold,
+        reason: "reconcile",
+      });
+
+      if (row) written++;
     }
-  }, [fetcher.data?.product?.id, shopify]);
-  const generateProduct = () => fetcher.submit({}, { method: "POST" });
+
+    hasNext = data.products.pageInfo.hasNextPage;
+    cursor = data.products.pageInfo.endCursor;
+  }
+
+  return { checked, written };
+};
+
+export default function Dashboard() {
+  const { products, threshold, pageInfo } = useLoaderData();
+
+  // The result from the last button click, if there was one.
+  const result = useActionData();
+
+  const navigation = useNavigation();
+  const loading = navigation.state === "loading";
+  const busy = navigation.state === "submitting";
 
   return (
-    <s-page heading="Shopify app template">
-      <s-button slot="primary-action" onClick={generateProduct}>
-        Generate a product
-      </s-button>
+    <div style={{ padding: "16px" }}>
+      <h1>Stock dashboard</h1>
+      <p>Low means 1 to {threshold} left.</p>
 
-      <s-section heading="Congrats on creating a new Shopify app 🎉">
-        <s-paragraph>
-          This embedded app template uses{" "}
-          <s-link
-            href="https://shopify.dev/docs/apps/tools/app-bridge"
-            target="_blank"
-          >
-            App Bridge
-          </s-link>{" "}
-          interface examples like an{" "}
-          <s-link href="/app/additional">additional page in the app nav</s-link>
-          , as well as an{" "}
-          <s-link
-            href="https://shopify.dev/docs/api/admin-graphql"
-            target="_blank"
-          >
-            Admin GraphQL
-          </s-link>{" "}
-          mutation demo, to provide a starting point for app development.
-        </s-paragraph>
-      </s-section>
-      <s-section heading="Get started with products">
-        <s-paragraph>
-          Generate a product with GraphQL and get the JSON output for that
-          product. Learn more about the{" "}
-          <s-link
-            href="https://shopify.dev/docs/api/admin-graphql/latest/mutations/productCreate"
-            target="_blank"
-          >
-            productCreate
-          </s-link>{" "}
-          mutation in our API references. Includes a product{" "}
-          <s-link
-            href="https://shopify.dev/docs/apps/build/custom-data/metafields"
-            target="_blank"
-          >
-            metafield
-          </s-link>{" "}
-          and{" "}
-          <s-link
-            href="https://shopify.dev/docs/apps/build/custom-data/metaobjects"
-            target="_blank"
-          >
-            metaobject
-          </s-link>
-          .
-        </s-paragraph>
-        <s-stack direction="inline" gap="base">
-          <s-button
-            onClick={generateProduct}
-            {...(isLoading ? { loading: true } : {})}
-          >
-            Generate a product
-          </s-button>
-          {fetcher.data?.product && (
-            <s-button
-              onClick={() => {
-                shopify.intents.invoke?.("edit:shopify/Product", {
-                  value: fetcher.data?.product?.id,
-                });
-              }}
-              target="_blank"
-              variant="tertiary"
-            >
-              Edit product
-            </s-button>
-          )}
-        </s-stack>
-        {fetcher.data?.product && (
-          <s-section heading="productCreate mutation">
-            <s-stack direction="block" gap="base">
-              <s-box
-                padding="base"
-                borderWidth="base"
-                borderRadius="base"
-                background="subdued"
-              >
-                <pre
-                  style={{
-                    margin: 0,
-                    whiteSpace: "pre-wrap",
-                    wordBreak: "break-word",
-                  }}
-                >
-                  <code>{JSON.stringify(fetcher.data.product, null, 2)}</code>
-                </pre>
-              </s-box>
+      {/* Sends a POST to this route, which runs the action above. */}
+      <Form method="post">
+        <button type="submit" disabled={busy}>
+          {busy ? "Checking all products..." : "Bring all in line"}
+        </button>
+      </Form>
 
-              <s-heading>productVariantsBulkUpdate mutation</s-heading>
-              <s-box
-                padding="base"
-                borderWidth="base"
-                borderRadius="base"
-                background="subdued"
-              >
-                <pre
-                  style={{
-                    margin: 0,
-                    whiteSpace: "pre-wrap",
-                    wordBreak: "break-word",
-                  }}
-                >
-                  <code>{JSON.stringify(fetcher.data.variant, null, 2)}</code>
-                </pre>
-              </s-box>
+      {result?.error && <p style={{ color: "red" }}>{result.error}</p>}
 
-              <s-heading>metaobjectUpsert mutation</s-heading>
-              <s-box
-                padding="base"
-                borderWidth="base"
-                borderRadius="base"
-                background="subdued"
-              >
-                <pre
-                  style={{
-                    margin: 0,
-                    whiteSpace: "pre-wrap",
-                    wordBreak: "break-word",
-                  }}
-                >
-                  <code>
-                    {JSON.stringify(fetcher.data.metaobject, null, 2)}
-                  </code>
-                </pre>
-              </s-box>
-            </s-stack>
-          </s-section>
-        )}
-      </s-section>
+      {result && !result.error && (
+        <p>
+          Checked {result.checked} tracked products. Recorded {result.written} status changes.
+        </p>
+      )}
 
-      <s-section slot="aside" heading="App template specs">
-        <s-paragraph>
-          <s-text>Framework: </s-text>
-          <s-link href="https://reactrouter.com/" target="_blank">
-            React Router
-          </s-link>
-        </s-paragraph>
-        <s-paragraph>
-          <s-text>Interface: </s-text>
-          <s-link
-            href="https://shopify.dev/docs/api/app-home/using-polaris-components"
-            target="_blank"
-          >
-            Polaris web components
-          </s-link>
-        </s-paragraph>
-        <s-paragraph>
-          <s-text>API: </s-text>
-          <s-link
-            href="https://shopify.dev/docs/api/admin-graphql"
-            target="_blank"
-          >
-            GraphQL
-          </s-link>
-        </s-paragraph>
-        <s-paragraph>
-          <s-text>Custom data: </s-text>
-          <s-link
-            href="https://shopify.dev/docs/apps/build/custom-data"
-            target="_blank"
-          >
-            Metafields &amp; metaobjects
-          </s-link>
-        </s-paragraph>
-        <s-paragraph>
-          <s-text>Database: </s-text>
-          <s-link href="https://www.prisma.io/" target="_blank">
-            Prisma
-          </s-link>
-        </s-paragraph>
-      </s-section>
+      {loading && <p>Loading...</p>}
 
-      <s-section slot="aside" heading="Next steps">
-        <s-unordered-list>
-          <s-list-item>
-            Build an{" "}
-            <s-link
-              href="https://shopify.dev/docs/apps/getting-started/build-app-example"
-              target="_blank"
-            >
-              example app
-            </s-link>
-          </s-list-item>
-          <s-list-item>
-            Explore Shopify&apos;s API with{" "}
-            <s-link
-              href="https://shopify.dev/docs/apps/tools/graphiql-admin-api"
-              target="_blank"
-            >
-              GraphiQL
-            </s-link>
-          </s-list-item>
-        </s-unordered-list>
-      </s-section>
-    </s-page>
+      {!loading && products.length === 0 && <p>No products found.</p>}
+
+      {products.length > 0 && (
+        <table style={{ width: "100%", borderCollapse: "collapse" }}>
+          <thead>
+            <tr>
+              <th style={{ textAlign: "left" }}>Image</th>
+              <th style={{ textAlign: "left" }}>Title</th>
+              <th style={{ textAlign: "left" }}>Stock</th>
+              <th style={{ textAlign: "left" }}>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {products.map((p) => (
+              <tr key={p.id}>
+                <td>
+                  {p.featuredMedia?.preview?.image?.url ? (
+                    <img
+                      src={p.featuredMedia.preview.image.url}
+                      alt={p.featuredMedia.preview.image.altText || p.title}
+                      width="48"
+                    />
+                  ) : (
+                    "No image"
+                  )}
+                </td>
+                <td>{p.title}</td>
+                <td>{p.totalInventory}</td>
+                <td>{p.status}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+
+      {pageInfo.hasNextPage && (
+        <p>
+          <Link to={`?cursor=${pageInfo.endCursor}`}>Next page</Link>
+        </p>
+      )}
+    </div>
   );
 }
-
-export const headers = (headersArgs) => {
-  return boundary.headers(headersArgs);
-};

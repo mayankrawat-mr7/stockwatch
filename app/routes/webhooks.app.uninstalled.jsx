@@ -11,6 +11,9 @@ export const action = async ({ request }) => {
   if (session) {
     await db.session.deleteMany({ where: { shop } });
   }
+    // Remove this shop's history rows. The config lives in the merchant's Shopify store,
+  // so there's nothing else of ours to delete.
+  await db.historyEvent.deleteMany({ where: { shop } });
 
   return new Response();
 };

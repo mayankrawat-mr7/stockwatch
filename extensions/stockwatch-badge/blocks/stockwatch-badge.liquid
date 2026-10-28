@@ -1,0 +1,51 @@
+{%- comment -%}
+  Read Maya's config from the shop metafield.
+  If the metafield is missing, the defaults below are used.
+{%- endcomment -%}
+{% assign raw = shop.metafields.stockwatch.config.value %}
+{% if raw != blank %}
+  {% assign config = raw | parse_json %}
+{% else %}
+  {% assign config = blank %}
+{% endif %}
+
+{% assign threshold = config.threshold | default: 5 %}
+{% assign message = config.message | default: 'Only {count} left!' %}
+{% assign show_zero = config.show_when_zero | default: false %}
+
+{%- comment -%}
+  Use the selected variant's stock. Confirm this works on your theme.
+{%- endcomment -%}
+{% assign qty = product.selected_or_first_available_variant.inventory_quantity %}
+
+{% if qty > 0 and qty <= threshold or qty == 0 and show_zero %}
+  {% assign text = message | replace: '{count}', qty | escape %}
+  <p class="stockwatch-badge-{{ block.id }}">{{ text }}</p>
+{% endif %}
+
+{%- comment -%}
+  Styles from the theme editor. The class name includes the block id,
+  so these styles don't affect the rest of the theme.
+{%- endcomment -%}
+<style>
+  .stockwatch-badge-{{ block.id }} {
+    display: inline-block;
+    padding: 6px 12px;
+    background: {{ block.settings.colour }};
+    color: #fff;
+    border-radius: {{ block.settings.radius }}px;
+    font-weight: 600;
+    margin: 8px 0;
+  }
+</style>
+
+{% schema %}
+{
+  "name": "Stock badge",
+  "target": "section",
+  "settings": [
+    { "type": "color", "id": "colour", "label": "Badge colour", "default": "#b5432a" },
+    { "type": "range", "id": "radius", "label": "Corner radius", "min": 0, "max": 30, "step": 1, "default": 12 }
+  ]
+}
+{% endschema %}

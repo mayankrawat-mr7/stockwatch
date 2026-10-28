@@ -32,3 +32,17 @@ model Session {
   refreshToken        String?
   refreshTokenExpires DateTime?
 }
+
+model HistoryEvent {
+  id             Int      @id @default(autoincrement())
+  shop           String
+  productId      String
+  fromStatus     String
+  toStatus       String
+  reason         String
+  totalInventory Int
+  createdAt      DateTime @default(now())
+
+  @@index([shop, productId, createdAt])
+  @@index([shop, createdAt])
+}
